@@ -349,48 +349,79 @@ if "messages" not in st.session_state:
 else:
     st.session_state.messages[0] = build_system_prompt(selected_language)
 
-if "last_camera_photo_id" not in st.session_state:
-    st.session_state.last_camera_photo_id = None
-
 for msg in st.session_state.messages[1:]:
     if msg["role"] in ("user", "assistant") and msg.get("content"):
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-# --- Dedicated camera capture (separate from the attach button below) ---
-with st.expander("📷 Take a photo with your camera"):
-    camera_caption = st.text_input(
-        "Optional: what do you want to know about this photo?",
-        key="camera_caption",
+if "pending_attachment" not in st.session_state:
+    st.session_state.pending_attachment = None
+if "last_attachment_id" not in st.session_state:
+    st.session_state.last_attachment_id = None
+
+# --- Unified attach menu: Camera / Photo / Document, like ChatGPT's "+" menu ---
+with st.popover("➕ Attach"):
+    attach_choice = st.radio(
+        "Add to your next message:",
+        ["📷 Camera", "🖼️ Photo", "📄 Document"],
+        horizontal=True,
+        key="attach_choice",
     )
-    camera_photo = st.camera_input("Take a photo", key="camera_widget")
 
-    if camera_photo is not None:
-        photo_bytes = camera_photo.getvalue()
-        photo_id = hashlib.md5(photo_bytes).hexdigest()
+    if attach_choice == "📷 Camera":
+        cam_file = st.camera_input("Take a photo", key="attach_camera")
+        if cam_file is not None:
+            file_bytes = cam_file.getvalue()
+            file_id = hashlib.md5(file_bytes).hexdigest()
+            if file_id != st.session_state.last_attachment_id:
+                st.session_state.pending_attachment = {
+                    "kind": "image", "bytes": file_bytes,
+                    "filename": "camera_photo.jpg", "mime": "image/jpeg",
+                }
+                st.session_state.last_attachment_id = file_id
+                st.rerun()
 
-        if photo_id != st.session_state.last_camera_photo_id:
-            st.session_state.last_camera_photo_id = photo_id
+    elif attach_choice == "🖼️ Photo":
+        photo_file = st.file_uploader("Upload a photo", type=sorted(IMAGE_EXTENSIONS), key="attach_photo")
+        if photo_file is not None:
+            file_bytes = photo_file.getvalue()
+            file_id = hashlib.md5(file_bytes).hexdigest()
+            if file_id != st.session_state.last_attachment_id:
+                st.session_state.pending_attachment = {
+                    "kind": "image", "bytes": file_bytes,
+                    "filename": photo_file.name, "mime": photo_file.type or "image/jpeg",
+                }
+                st.session_state.last_attachment_id = file_id
+                st.rerun()
 
-            with st.spinner("Looking at your photo..."):
-                image_description = analyze_image(photo_bytes, "image/jpeg", camera_caption)
+    else:  # Document
+        doc_file = st.file_uploader("Upload a document", type=sorted(DOCUMENT_EXTENSIONS), key="attach_document")
+        if doc_file is not None:
+            file_bytes = doc_file.getvalue()
+            file_id = hashlib.md5(file_bytes).hexdigest()
+            if file_id != st.session_state.last_attachment_id:
+                st.session_state.pending_attachment = {
+                    "kind": "document", "bytes": file_bytes,
+                    "filename": doc_file.name, "mime": None,
+                }
+                st.session_state.last_attachment_id = file_id
+                st.rerun()
 
-            combined_text = (camera_caption or "").strip()
-            combined_text = (combined_text + f"\n\n[Image content]: {image_description}").strip()
+# Show what's queued to go out with the next message, with a way to remove it
+if st.session_state.pending_attachment:
+    att = st.session_state.pending_attachment
+    col1, col2 = st.columns([10, 1])
+    with col1:
+        icon = "🖼️" if att["kind"] == "image" else "📄"
+        st.caption(f"{icon} {att['filename']} — will be sent with your next message")
+    with col2:
+        if st.button("✕", key="clear_attachment", help="Remove attachment"):
+            st.session_state.pending_attachment = None
+            st.rerun()
 
-            st.session_state.messages.append({"role": "user", "content": combined_text})
-            with st.chat_message("user"):
-                if camera_caption:
-                    st.markdown(camera_caption)
-                st.image(photo_bytes, width=250)
-
-            render_assistant_response()
-
-# --- Main chat input: text, attach a file (image or document), or record voice ---
+# --- Main chat input: text and/or voice. Attachments come from the menu above. ---
 prompt = st.chat_input(
-    "Ask, attach a photo/document, or tap the mic to speak...",
-    accept_file=True,
-    file_type=ALL_UPLOAD_TYPES,
+    "Ask something, or attach a photo/document above...",
     accept_audio=True,
 )
 
@@ -404,24 +435,22 @@ if prompt:
             transcribed = transcribe_audio(prompt.audio)
         user_text = (user_text + " " + transcribed).strip()
 
-    # --- Handle an attached file (image OR document) ---
+    # --- Handle a queued attachment (photo, camera capture, or document) ---
     image_bytes = None
     attached_filename = None
-    if prompt.files:
-        uploaded_file = prompt.files[0]
-        attached_filename = uploaded_file.name
-        ext = attached_filename.rsplit(".", 1)[-1].lower()
-
-        if ext in IMAGE_EXTENSIONS:
-            image_bytes = uploaded_file.getvalue()
-            image_mime = uploaded_file.type or "image/jpeg"
+    att = st.session_state.pending_attachment
+    if att:
+        attached_filename = att["filename"]
+        if att["kind"] == "image":
+            image_bytes = att["bytes"]
             with st.spinner("Looking at your photo..."):
-                image_description = analyze_image(image_bytes, image_mime, user_text)
+                image_description = analyze_image(image_bytes, att["mime"], user_text)
             extra_context_parts.append(f"[Image content]: {image_description}")
         else:
             with st.spinner(f"Reading {attached_filename}..."):
-                doc_text = extract_document_text(uploaded_file.getvalue(), attached_filename)
+                doc_text = extract_document_text(att["bytes"], attached_filename)
             extra_context_parts.append(f"[Document: {attached_filename}]\n{doc_text}")
+        st.session_state.pending_attachment = None  # clear once it's been sent
 
     combined_text = user_text
     if extra_context_parts:
