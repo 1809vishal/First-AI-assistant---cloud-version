@@ -29,6 +29,9 @@ import io
 import base64
 import json
 import hashlib
+import sqlite3
+import uuid
+import datetime
 import streamlit as st
 from groq import Groq
 from sentence_transformers import SentenceTransformer
@@ -48,6 +51,7 @@ CHUNK_OVERLAP = 50
 
 IMAGE_EXTENSIONS = {"png", "jpg", "jpeg"}
 DOCUMENT_EXTENSIONS = {"pdf", "docx", "txt", "csv"}
+DB_PATH = "conversations.db"
 ALL_UPLOAD_TYPES = sorted(IMAGE_EXTENSIONS | DOCUMENT_EXTENSIONS)
 
 LANGUAGES = [
@@ -57,6 +61,71 @@ LANGUAGES = [
 ]
 
 st.set_page_config(page_title="My AI Assistant", page_icon="🤖")
+
+# --- Require login so each person only sees their OWN chat history ---
+if not st.user.is_logged_in:
+    st.title("🤖 My AI Assistant")
+    st.write("Please log in to continue -- this keeps your chat history private to you.")
+    st.button("Log in with Google", on_click=st.login)
+    st.stop()
+
+USER_EMAIL = st.user.email
+
+
+# --- Conversation storage (SQLite) ---
+def get_db():
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS conversations (
+            id TEXT PRIMARY KEY,
+            user_email TEXT NOT NULL,
+            title TEXT,
+            updated_at TEXT,
+            messages_json TEXT
+        )
+    """)
+    return conn
+
+
+def save_conversation(user_email: str, conv_id: str, title: str, messages: list):
+    conn = get_db()
+    conn.execute(
+        """INSERT INTO conversations (id, user_email, title, updated_at, messages_json)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET
+               title=excluded.title,
+               updated_at=excluded.updated_at,
+               messages_json=excluded.messages_json""",
+        (conv_id, user_email, title, datetime.datetime.utcnow().isoformat(), json.dumps(messages)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def list_conversations(user_email: str, search_query: str = "") -> list:
+    conn = get_db()
+    if search_query:
+        like = f"%{search_query}%"
+        rows = conn.execute(
+            """SELECT id, title, updated_at FROM conversations
+               WHERE user_email=? AND (title LIKE ? OR messages_json LIKE ?)
+               ORDER BY updated_at DESC""",
+            (user_email, like, like),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, title, updated_at FROM conversations WHERE user_email=? ORDER BY updated_at DESC",
+            (user_email,),
+        ).fetchall()
+    conn.close()
+    return rows
+
+
+def load_conversation(conv_id: str):
+    conn = get_db()
+    row = conn.execute("SELECT messages_json FROM conversations WHERE id=?", (conv_id,)).fetchone()
+    conn.close()
+    return json.loads(row[0]) if row else None
 
 # --- Groq client (reads key from Streamlit secrets, not env vars) ---
 groq_client = Groq(api_key=st.secrets["GROQ_API_KEY"])
@@ -336,6 +405,11 @@ def render_assistant_response():
             st.markdown(final_text)
             st.session_state.messages.append({"role": "assistant", "content": final_text})
 
+    # Auto-save this conversation so it shows up in history
+    first_user_msg = next((m["content"] for m in st.session_state.messages if m["role"] == "user"), "New chat")
+    title = first_user_msg[:50] + ("..." if len(first_user_msg) > 50 else "")
+    save_conversation(USER_EMAIL, st.session_state.current_conversation_id, title, st.session_state.messages)
+
 
 st.title("🤖 My AI Assistant")
 st.caption("Live web search + company policy RAG + photos/documents + voice — hosted, available 24/7")
@@ -343,6 +417,36 @@ st.caption("Live web search + company policy RAG + photos/documents + voice — 
 with st.sidebar:
     st.subheader("Settings")
     selected_language = st.selectbox("Response language", LANGUAGES, index=0)
+
+    st.divider()
+    st.subheader("History")
+
+    if st.button("➕ New chat", use_container_width=True):
+        st.session_state.current_conversation_id = str(uuid.uuid4())
+        st.session_state.messages = [build_system_prompt(selected_language)]
+        st.rerun()
+
+    history_search = st.text_input("🔍 Search history", key="history_search")
+    past_conversations = list_conversations(USER_EMAIL, history_search)
+
+    if not past_conversations:
+        st.caption("No conversations found." if history_search else "No past conversations yet.")
+    else:
+        for conv_id, title, updated_at in past_conversations:
+            label = title or "Untitled chat"
+            if st.button(label, key=f"conv_{conv_id}", use_container_width=True):
+                loaded_messages = load_conversation(conv_id)
+                if loaded_messages:
+                    st.session_state.messages = loaded_messages
+                    st.session_state.current_conversation_id = conv_id
+                    st.rerun()
+
+    st.divider()
+    st.caption(f"Logged in as {st.user.email}")
+    st.button("Log out", on_click=st.logout)
+
+if "current_conversation_id" not in st.session_state:
+    st.session_state.current_conversation_id = str(uuid.uuid4())
 
 if "messages" not in st.session_state:
     st.session_state.messages = [build_system_prompt(selected_language)]
@@ -354,11 +458,35 @@ for msg in st.session_state.messages[1:]:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
+if "camera_pending" not in st.session_state:
+    st.session_state.camera_pending = None
+if "last_camera_id" not in st.session_state:
+    st.session_state.last_camera_id = None
+
+# --- Compact, dedicated camera button (guaranteed to work, unlike the ---
+# --- native "+" picker's camera option, which depends on the browser) ---
+cam_col, _ = st.columns([1, 9])
+with cam_col:
+    with st.popover("📷", help="Take a photo"):
+        cam_file = st.camera_input("Take a photo", key="dedicated_camera", label_visibility="collapsed")
+        if cam_file is not None:
+            file_bytes = cam_file.getvalue()
+            file_id = hashlib.md5(file_bytes).hexdigest()
+            if file_id != st.session_state.last_camera_id:
+                st.session_state.camera_pending = {"bytes": file_bytes, "mime": "image/jpeg"}
+                st.session_state.last_camera_id = file_id
+                st.rerun()
+
+if st.session_state.camera_pending:
+    chip_col, clear_col = st.columns([10, 1])
+    with chip_col:
+        st.caption("📷 Photo captured — will be sent with your next message")
+    with clear_col:
+        if st.button("✕", key="clear_camera_pending", help="Remove photo"):
+            st.session_state.camera_pending = None
+            st.rerun()
+
 # --- Main chat input: text, attach a photo/document, or record voice --
-# All three live in the SAME bar via Streamlit's native chat_input --
-# tapping "+" on mobile opens the OS's own picker, which offers
-# Camera / Photo Library / Files automatically since file_type includes
-# image extensions -- no separate menu needed for that.
 prompt = st.chat_input(
     "Ask, attach a photo/document, or tap the mic to speak...",
     accept_file=True,
@@ -376,7 +504,7 @@ if prompt:
             transcribed = transcribe_audio(prompt.audio)
         user_text = (user_text + " " + transcribed).strip()
 
-    # --- Handle an attached file (image OR document) ---
+    # --- Handle an attached file from the bar (image OR document) ---
     image_bytes = None
     attached_filename = None
     if prompt.files:
@@ -394,6 +522,15 @@ if prompt:
             with st.spinner(f"Reading {attached_filename}..."):
                 doc_text = extract_document_text(uploaded_file.getvalue(), attached_filename)
             extra_context_parts.append(f"[Document: {attached_filename}]\n{doc_text}")
+
+    # --- Handle a photo from the dedicated camera button, if queued ---
+    if st.session_state.camera_pending:
+        cam = st.session_state.camera_pending
+        image_bytes = cam["bytes"]  # shown in the user bubble below
+        with st.spinner("Looking at your photo..."):
+            image_description = analyze_image(cam["bytes"], cam["mime"], user_text)
+        extra_context_parts.append(f"[Image content]: {image_description}")
+        st.session_state.camera_pending = None
 
     combined_text = user_text
     if extra_context_parts:
