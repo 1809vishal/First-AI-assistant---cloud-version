@@ -465,17 +465,15 @@ if "last_camera_id" not in st.session_state:
 
 # --- Compact, dedicated camera button (guaranteed to work, unlike the ---
 # --- native "+" picker's camera option, which depends on the browser) ---
-cam_col, _ = st.columns([1, 9])
-with cam_col:
-    with st.popover("📷", help="Take a photo"):
-        cam_file = st.camera_input("Take a photo", key="dedicated_camera", label_visibility="collapsed")
-        if cam_file is not None:
-            file_bytes = cam_file.getvalue()
-            file_id = hashlib.md5(file_bytes).hexdigest()
-            if file_id != st.session_state.last_camera_id:
-                st.session_state.camera_pending = {"bytes": file_bytes, "mime": "image/jpeg"}
-                st.session_state.last_camera_id = file_id
-                st.rerun()
+with st.popover("📷 Take a photo"):
+    cam_file = st.camera_input("Take a photo", key="dedicated_camera", label_visibility="collapsed")
+    if cam_file is not None:
+        file_bytes = cam_file.getvalue()
+        file_id = hashlib.md5(file_bytes).hexdigest()
+        if file_id != st.session_state.last_camera_id:
+            st.session_state.camera_pending = {"bytes": file_bytes, "mime": "image/jpeg"}
+            st.session_state.last_camera_id = file_id
+            st.rerun()
 
 if st.session_state.camera_pending:
     chip_col, clear_col = st.columns([10, 1])
